@@ -21,11 +21,8 @@ SHEET_TRANSACTIONS = "Transactions"
 SHEET_PLAYER_SUMMARY = "Player_Summary"
 SHEET_BANK_LIST = "Bank_List"
 
-ACTIVE_STATUS = {"ACTIVE"}
-STOP_STATUS = {"STOP", "LIMIT", "ISSUE", "INACTIVE", "OFF", "CLOSED", "DISABLED"}
-
-# Per member + per bank + per day
 MAX_DAILY_DEPOSIT_PER_BANK = int(os.environ.get("MAX_DAILY_DEPOSIT_PER_BANK", "3"))
+ACTIVE_STATUS = {"ACTIVE"}
 
 app = Flask(__name__)
 
@@ -38,12 +35,29 @@ def normalize(x):
     return clean_text(x).lower()
 
 
+def now():
+    return datetime.now(ZoneInfo(TIMEZONE))
+
+
 def today_str():
-    return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+    return now().strftime("%Y-%m-%d")
 
 
 def now_str():
-    return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+    return now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_amount(x):
+    try:
+        return float(str(x).replace(",", "").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def fmt_money(x):
+    if float(x).is_integer():
+        return f"{int(x):,}"
+    return f"{x:,.2f}"
 
 
 def get_sheet():
@@ -58,21 +72,10 @@ def get_sheet():
 
 
 def send_message(chat_id, text, reply_to_message_id=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-
-
-def parse_command(text):
-    parts = clean_text(text).split()
-    if not parts:
-        return "", []
-    return parts[0].lower(), parts[1:]
 
 
 def safe_get(row, index, default=""):
@@ -82,16 +85,7 @@ def safe_get(row, index, default=""):
         return default
 
 
-def get_bank_status_map():
-    """
-    Bank_List expected:
-    Row 3 header:
-    A = Bank Name
-    B = Alias
-    C = Status
-
-    Data starts row 4.
-    """
+def get_bank_maps():
     ss = get_sheet()
     ws = ss.worksheet(SHEET_BANK_LIST)
     rows = ws.get_all_values()
@@ -100,84 +94,63 @@ def get_bank_status_map():
     alias_map = {}
 
     for row in rows[3:]:
-        bank_name = safe_get(row, 0)
+        bank = safe_get(row, 0)
         alias = safe_get(row, 1)
         status = safe_get(row, 2).upper() or "ACTIVE"
-
-        if not bank_name:
+        if not bank:
             continue
 
-        bank_map[normalize(bank_name)] = {
-            "name": bank_name,
-            "alias": alias,
-            "status": status,
-        }
+        bank_map[normalize(bank)] = {"name": bank, "alias": alias, "status": status}
 
         if alias:
-            alias_map[normalize(alias)] = bank_name
+            alias_map[normalize(alias)] = bank
 
-        # also allow full bank name as alias
-        alias_map[normalize(bank_name)] = bank_name
+        alias_map[normalize(bank)] = bank
 
     return bank_map, alias_map
 
 
 def resolve_bank(bank_input):
-    """
-    Convert alias/full text to official bank name from Bank_List.
-    Example:
-    award -> CIMB AWARD CLOTHING
-    """
-    bank_map, alias_map = get_bank_status_map()
+    bank_map, alias_map = get_bank_maps()
     key = normalize(bank_input)
 
-    # exact alias/full match
     if key in alias_map:
-        bank_name = alias_map[key]
-        item = bank_map.get(normalize(bank_name))
-        status = item["status"] if item else "NOT FOUND"
-        return bank_name, status
+        bank = alias_map[key]
+        status = bank_map.get(normalize(bank), {}).get("status", "NOT FOUND")
+        return bank, status
 
-    # partial matching, e.g. "awar" can find "award" if unique
     matches = []
-    for alias_key, bank_name in alias_map.items():
+    for alias_key, bank in alias_map.items():
         if key and key in alias_key:
-            matches.append(bank_name)
+            matches.append(bank)
 
-    unique_matches = []
+    unique = []
     seen = set()
     for m in matches:
-        mk = normalize(m)
-        if mk not in seen:
-            seen.add(mk)
-            unique_matches.append(m)
+        if normalize(m) not in seen:
+            seen.add(normalize(m))
+            unique.append(m)
 
-    if len(unique_matches) == 1:
-        bank_name = unique_matches[0]
-        item = bank_map.get(normalize(bank_name))
-        status = item["status"] if item else "NOT FOUND"
-        return bank_name, status
+    if len(unique) == 1:
+        bank = unique[0]
+        status = bank_map.get(normalize(bank), {}).get("status", "NOT FOUND")
+        return bank, status
 
-    if len(unique_matches) > 1:
+    if len(unique) > 1:
         return None, "AMBIGUOUS"
 
     return None, "NOT FOUND"
 
 
-def is_bank_active_by_status(status):
-    return clean_text(status).upper() in ACTIVE_STATUS
-
-
-def get_all_active_banks():
-    bank_map, _ = get_bank_status_map()
+def get_active_and_stopped_banks():
+    bank_map, _ = get_bank_maps()
     active = []
     stopped = []
 
     for item in bank_map.values():
         name = item["name"]
         status = item["status"]
-
-        if is_bank_active_by_status(status):
+        if status in ACTIVE_STATUS:
             active.append(name)
         else:
             stopped.append(f"{name} ({status})")
@@ -185,73 +158,14 @@ def get_all_active_banks():
     return active, stopped
 
 
-def find_summary_row(player):
-    ss = get_sheet()
-    ws = ss.worksheet(SHEET_PLAYER_SUMMARY)
-    rows = ws.get_all_values()
-
-    if not rows or len(rows) < 4:
-        return None, None
-
-    headers = rows[2]
-    player_key = normalize(player)
-
-    for row in rows[3:]:
-        if row and normalize(row[0]) == player_key:
-            return headers, row
-
-    return headers, None
-
-
-def get_summary_value(headers, row, header_name):
-    for i, h in enumerate(headers):
-        if normalize(h) == normalize(header_name):
-            return clean_text(row[i]) if i < len(row) else ""
-    return ""
-
-
-def get_bank_status_from_summary(headers, row, bank_name):
-    bank_key = normalize(bank_name)
-
-    for i, h in enumerate(headers):
-        if normalize(h) == bank_key:
-            return clean_text(row[i]) if i < len(row) else ""
-
-    return None
-
-
-def split_bank_list(value):
-    if not value or value == "-":
-        return []
-    parts = [clean_text(x) for x in str(value).split(",")]
-    return [x for x in parts if x]
-
-
-def get_transactions_rows():
-    ss = get_sheet()
-    ws = ss.worksheet(SHEET_TRANSACTIONS)
-    return ws.get_all_values()
-
-
 def parse_date_is_today(value):
-    """
-    Accepts:
-    2026-05-12 18:22:01
-    2026-05-12
-    12/05/2026
-    5/12/2026
-    Google text date formats will still pass if starts with YYYY-MM-DD.
-    """
     raw = clean_text(value)
     if not raw:
         return False
 
-    today = today_str()
-
-    if raw.startswith(today):
+    if raw.startswith(today_str()):
         return True
 
-    # Try common date formats
     fmts = [
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d",
@@ -264,110 +178,101 @@ def parse_date_is_today(value):
     for fmt in fmts:
         try:
             dt = datetime.strptime(raw, fmt)
-            return dt.strftime("%Y-%m-%d") == today
+            return dt.strftime("%Y-%m-%d") == today_str()
         except Exception:
             pass
 
     return False
 
 
-def get_today_deposit_counts_by_bank(player):
-    """
-    Count per member + per bank + per day from Transactions:
-    A Date | B Player | C Type | D Bank | E Amount | F Remark | G Entered By
-    """
-    rows = get_transactions_rows()
-    player_key = normalize(player)
-    counts = {}
+def get_transactions():
+    ss = get_sheet()
+    ws = ss.worksheet(SHEET_TRANSACTIONS)
+    return ws.get_all_values()
+
+
+def get_today_stats(player=None):
+    rows = get_transactions()
+
+    player_counts = {}
+    bank_totals = {}
+
+    player_key = normalize(player) if player else None
 
     for row in rows[3:]:
         date_value = safe_get(row, 0)
         tx_player = safe_get(row, 1)
         tx_type = safe_get(row, 2)
         bank = safe_get(row, 3)
-
-        if not bank:
-            continue
-
-        if normalize(tx_player) != player_key:
-            continue
+        amount = parse_amount(safe_get(row, 4))
 
         if normalize(tx_type) != "deposit":
+            continue
+
+        if not bank:
             continue
 
         if not parse_date_is_today(date_value):
             continue
 
         bank_key = normalize(bank)
-        if bank_key not in counts:
-            counts[bank_key] = {
-                "bank": bank,
-                "count": 0,
-            }
+        bank_totals[bank_key] = bank_totals.get(bank_key, 0.0) + amount
 
-        counts[bank_key]["count"] += 1
+        if player_key and normalize(tx_player) == player_key:
+            player_counts[bank_key] = player_counts.get(bank_key, 0) + 1
 
-    return counts
+    return player_counts, bank_totals
 
 
-def get_used_deposit_banks_from_summary(headers, row):
-    used = get_summary_value(headers, row, "Deposit Banks Used")
-    return split_bank_list(used)
+def find_summary_row(player):
+    ss = get_sheet()
+    ws = ss.worksheet(SHEET_PLAYER_SUMMARY)
+    rows = ws.get_all_values()
+
+    if not rows or len(rows) < 4:
+        return None, None
+
+    headers = rows[2]
+    key = normalize(player)
+
+    for row in rows[3:]:
+        if row and normalize(row[0]) == key:
+            return headers, row
+
+    return headers, None
 
 
-def get_player_check_message(player):
-    headers, row = find_summary_row(player)
-    if not row:
-        return f"❌ Player not found:\n<b>{player}</b>"
+def get_summary_value(headers, row, header_name):
+    for i, h in enumerate(headers):
+        if normalize(h) == normalize(header_name):
+            return clean_text(row[i]) if i < len(row) else ""
+    return ""
 
-    official_player = clean_text(row[0])
-    used_banks = get_used_deposit_banks_from_summary(headers, row)
-    today_counts = get_today_deposit_counts_by_bank(official_player)
-    active_banks, stopped_banks = get_all_active_banks()
 
-    # Deposit banks used, filtered only simple output
-    used_text = "\n".join([f"• {b}" for b in used_banks]) if used_banks else "-"
+def split_bank_list(value):
+    if not value or value == "-":
+        return []
+    return [clean_text(x) for x in str(value).split(",") if clean_text(x)]
 
-    # Today usage only for banks this player has used today
-    today_lines = []
-    danger_lines = []
 
-    for item in today_counts.values():
-        bank = item["bank"]
-        count = item["count"]
-        today_lines.append(f"• {bank}: {count}x today")
-
-        if count >= MAX_DAILY_DEPOSIT_PER_BANK:
-            danger_lines.append(f"🚫 DO NOT GIVE {bank} ({count}/{MAX_DAILY_DEPOSIT_PER_BANK})")
-        elif count == MAX_DAILY_DEPOSIT_PER_BANK - 1:
-            danger_lines.append(f"⚠️ Almost limit {bank} ({count}/{MAX_DAILY_DEPOSIT_PER_BANK})")
-
-    today_text = "\n".join(today_lines) if today_lines else "-"
-
-    # Show stopped banks only
-    stop_text = "\n".join([f"• {x}" for x in stopped_banks]) if stopped_banks else "-"
-
-    warning_text = "\n".join(danger_lines) if danger_lines else "OK"
-
-    return (
-        f"🔎 <b>Player Check</b>\n\n"
-        f"👤 Player: <b>{official_player}</b>\n\n"
-        f"🏦 Deposit Banks Used:\n{used_text}\n\n"
-        f"📊 Today Usage:\n{today_text}\n\n"
-        f"⛔ STOP/LIMIT/INACTIVE Banks:\n{stop_text}\n\n"
-        f"⚠️ Warning:\n{warning_text}"
-    )
+def get_used_banks(headers, row):
+    return split_bank_list(get_summary_value(headers, row, "Deposit Banks Used"))
 
 
 def append_transaction(player, tx_type, amount, bank, entered_by="BOT", remark=""):
     ss = get_sheet()
     ws = ss.worksheet(SHEET_TRANSACTIONS)
-
-    # A Date | B Player | C Type | D Bank | E Amount | F Remark | G Entered By
     ws.append_row(
         [now_str(), player, tx_type, bank, amount, remark, entered_by],
         value_input_option="USER_ENTERED",
     )
+
+
+def get_bank_status_from_summary(headers, row, bank):
+    for i, h in enumerate(headers):
+        if normalize(h) == normalize(bank):
+            return clean_text(row[i]) if i < len(row) else ""
+    return None
 
 
 def bank_was_used_for_deposit(player, bank):
@@ -376,147 +281,59 @@ def bank_was_used_for_deposit(player, bank):
         return False, None
 
     status = get_bank_status_from_summary(headers, row, bank)
-
     if status is None:
         return False, None
 
     return normalize(status) == "dep used", status
 
 
-def get_player_from_replied_message(message):
-    reply = message.get("reply_to_message") or {}
-    text = clean_text(reply.get("text") or reply.get("caption") or "")
+def get_player_check(player):
+    headers, row = find_summary_row(player)
+    if not row:
+        return f"❌ Player not found:\n<b>{player}</b>"
 
-    if not text:
-        return ""
+    official_player = clean_text(row[0])
+    used_banks = get_used_banks(headers, row)
 
-    # Use first line as player name
-    first_line = clean_text(text.splitlines()[0])
+    active_banks, stopped_banks = get_active_and_stopped_banks()
+    player_counts, bank_totals = get_today_stats(official_player)
 
-    # If CS message has common prefix like "Player: ani0128"
-    m = re.search(r"(?:player|username|user)\s*[:：]\s*(.+)", first_line, re.I)
-    if m:
-        return clean_text(m.group(1))
+    used_text = "\n".join([f"• {b}" for b in used_banks]) if used_banks else "-"
 
-    return first_line
+    available_lines = []
+    stop_lines = []
 
+    for bank in active_banks:
+        key = normalize(bank)
+        player_count = player_counts.get(key, 0)
+        bank_total = bank_totals.get(key, 0.0)
 
-def parse_reply_deposit(text):
-    """
-    Accept:
-    +500 award
-    +1,000 award
-    +300.50 horizon
-    """
-    raw = clean_text(text)
+        if player_count >= MAX_DAILY_DEPOSIT_PER_BANK:
+            stop_lines.append(f"• {bank} — player limit {player_count}/{MAX_DAILY_DEPOSIT_PER_BANK}")
+            continue
 
-    m = re.match(r"^\+(\d[\d,]*(?:\.\d{1,2})?)\s+(.+)$", raw)
-    if not m:
-        return None
-
-    amount = m.group(1).replace(",", "")
-    bank_alias = clean_text(m.group(2))
-
-    return amount, bank_alias
-
-
-def handle_reply_deposit(message):
-    text = clean_text(message.get("text", ""))
-    parsed = parse_reply_deposit(text)
-
-    if not parsed:
-        return None
-
-    amount, bank_alias = parsed
-    player = get_player_from_replied_message(message)
-
-    if not player:
-        return (
-            "❌ Please reply to CS/player message when confirming deposit.\n\n"
-            "Format:\n"
-            "<code>+500 award</code>"
+        available_lines.append(
+            f"• {bank} — player {player_count}/{MAX_DAILY_DEPOSIT_PER_BANK} | bank today {fmt_money(bank_total)}"
         )
 
-    bank_name, bank_status = resolve_bank(bank_alias)
+    for item in stopped_banks:
+        stop_lines.append(f"• {item}")
 
-    if bank_status == "AMBIGUOUS":
-        return (
-            f"❌ Bank alias ambiguous:\n"
-            f"<b>{bank_alias}</b>\n\n"
-            f"Please use clearer alias."
-        )
-
-    if not bank_name:
-        return (
-            f"❌ Bank alias not found:\n"
-            f"<b>{bank_alias}</b>\n\n"
-            f"Please check Bank_List alias."
-        )
-
-    if not is_bank_active_by_status(bank_status):
-        return (
-            f"❌ <b>DEPOSIT REJECTED</b>\n\n"
-            f"👤 Player: <b>{player}</b>\n"
-            f"🏦 Bank: <b>{bank_name}</b>\n"
-            f"Status: <b>{bank_status}</b>\n\n"
-            f"Reason: Bank is not ACTIVE."
-        )
-
-    # Check today's usage BEFORE recording this deposit
-    today_counts = get_today_deposit_counts_by_bank(player)
-    current_count = today_counts.get(normalize(bank_name), {}).get("count", 0)
-
-    if current_count >= MAX_DAILY_DEPOSIT_PER_BANK:
-        return (
-            f"🚫 <b>DEPOSIT REJECTED</b>\n\n"
-            f"👤 Player: <b>{player}</b>\n"
-            f"🏦 Bank: <b>{bank_name}</b>\n"
-            f"Today usage: <b>{current_count}/{MAX_DAILY_DEPOSIT_PER_BANK}</b>\n\n"
-            f"Reason: Player already reached daily limit for this bank."
-        )
-
-    username = (
-        message.get("from", {}).get("username")
-        or message.get("from", {}).get("first_name")
-        or "BOT"
-    )
-
-    append_transaction(
-        player=player,
-        tx_type="Deposit",
-        amount=amount,
-        bank=bank_name,
-        entered_by=username,
-        remark=f"Telegram reply + | alias: {bank_alias}",
-    )
-
-    new_count = current_count + 1
-
-    warning = "OK"
-    if new_count >= MAX_DAILY_DEPOSIT_PER_BANK:
-        warning = f"🚫 LIMIT REACHED for {bank_name} ({new_count}/{MAX_DAILY_DEPOSIT_PER_BANK})"
-    elif new_count == MAX_DAILY_DEPOSIT_PER_BANK - 1:
-        warning = f"⚠️ Almost limit for {bank_name} ({new_count}/{MAX_DAILY_DEPOSIT_PER_BANK})"
+    available_text = "\n".join(available_lines) if available_lines else "-"
+    stop_text = "\n".join(stop_lines) if stop_lines else "-"
 
     return (
-        f"✅ <b>Deposit recorded</b>\n\n"
-        f"👤 Player: <b>{player}</b>\n"
-        f"💰 Amount: <b>{amount}</b>\n"
-        f"🏦 Bank: <b>{bank_name}</b>\n"
-        f"📊 Today usage: <b>{new_count}/{MAX_DAILY_DEPOSIT_PER_BANK}</b>\n\n"
-        f"{warning}"
+        f"🔎 <b>Player Check</b>\n\n"
+        f"👤 Player: <b>{official_player}</b>\n\n"
+        f"🏦 Deposit Banks Used:\n{used_text}\n\n"
+        f"✅ Available Deposit Banks:\n{available_text}\n\n"
+        f"🚫 Do Not Give:\n{stop_text}"
     )
 
 
-def handle_dep_command(args, username):
+def handle_dep(args, username):
     if len(args) < 3:
-        return (
-            "❌ Format salah.\n\n"
-            "Gunakan:\n"
-            "<code>/dep player amount bank_alias</code>\n\n"
-            "Contoh:\n"
-            "<code>/dep Jimmy88 500 horizon</code>"
-        )
+        return "❌ Format: <code>/dep player amount bank_alias</code>"
 
     player = args[0]
     amount = args[1].replace(",", "")
@@ -525,62 +342,65 @@ def handle_dep_command(args, username):
     if not re.match(r"^\d+(\.\d{1,2})?$", amount):
         return "❌ Amount tidak valid."
 
-    bank_name, bank_status = resolve_bank(bank_alias)
+    bank, status = resolve_bank(bank_alias)
 
-    if bank_status == "AMBIGUOUS":
+    if status == "AMBIGUOUS":
         return f"❌ Bank alias ambiguous: <b>{bank_alias}</b>"
 
-    if not bank_name:
+    if not bank:
         return f"❌ Bank alias not found: <b>{bank_alias}</b>"
 
-    if not is_bank_active_by_status(bank_status):
+    if status not in ACTIVE_STATUS:
         return (
             f"❌ <b>DEPOSIT REJECTED</b>\n\n"
-            f"🏦 Bank: <b>{bank_name}</b>\n"
-            f"Status: <b>{bank_status}</b>\n\n"
-            f"Reason: Bank is not ACTIVE in Bank_List."
+            f"🏦 Bank: <b>{bank}</b>\n"
+            f"Status: <b>{status}</b>"
         )
 
-    today_counts = get_today_deposit_counts_by_bank(player)
-    current_count = today_counts.get(normalize(bank_name), {}).get("count", 0)
+    player_counts, bank_totals = get_today_stats(player)
+    current_count = player_counts.get(normalize(bank), 0)
 
     if current_count >= MAX_DAILY_DEPOSIT_PER_BANK:
         return (
             f"🚫 <b>DEPOSIT REJECTED</b>\n\n"
             f"👤 Player: <b>{player}</b>\n"
-            f"🏦 Bank: <b>{bank_name}</b>\n"
-            f"Today usage: <b>{current_count}/{MAX_DAILY_DEPOSIT_PER_BANK}</b>"
+            f"🏦 Bank: <b>{bank}</b>\n"
+            f"Player usage today: <b>{current_count}/{MAX_DAILY_DEPOSIT_PER_BANK}</b>"
         )
 
     append_transaction(
         player=player,
         tx_type="Deposit",
         amount=amount,
-        bank=bank_name,
+        bank=bank,
         entered_by=username,
         remark=f"Telegram /dep | alias: {bank_alias}",
     )
 
+    amount_float = parse_amount(amount)
     new_count = current_count + 1
+    new_bank_total = bank_totals.get(normalize(bank), 0.0) + amount_float
+
+    warning = ""
+    if new_count >= MAX_DAILY_DEPOSIT_PER_BANK:
+        warning = f"\n\n🚫 LIMIT REACHED for this player on {bank}"
+    elif new_count == MAX_DAILY_DEPOSIT_PER_BANK - 1:
+        warning = f"\n\n⚠️ Almost limit for this player on {bank}"
 
     return (
         f"✅ <b>Deposit recorded</b>\n\n"
         f"👤 Player: <b>{player}</b>\n"
-        f"💰 Amount: <b>{amount}</b>\n"
-        f"🏦 Bank: <b>{bank_name}</b>\n"
-        f"📊 Today usage: <b>{new_count}/{MAX_DAILY_DEPOSIT_PER_BANK}</b>"
+        f"💰 Amount: <b>{fmt_money(amount_float)}</b>\n"
+        f"🏦 Bank: <b>{bank}</b>\n"
+        f"📊 Player usage today: <b>{new_count}/{MAX_DAILY_DEPOSIT_PER_BANK}</b>\n"
+        f"🏦 Bank total today: <b>{fmt_money(new_bank_total)}</b>"
+        f"{warning}"
     )
 
 
 def handle_wd(args, username):
     if len(args) < 3:
-        return (
-            "❌ Format salah.\n\n"
-            "Gunakan:\n"
-            "<code>/wd player amount bank_alias</code>\n\n"
-            "Contoh:\n"
-            "<code>/wd Jimmy88 300 cozy</code>"
-        )
+        return "❌ Format: <code>/wd player amount bank_alias</code>"
 
     player = args[0]
     amount = args[1].replace(",", "")
@@ -589,37 +409,24 @@ def handle_wd(args, username):
     if not re.match(r"^\d+(\.\d{1,2})?$", amount):
         return "❌ Amount tidak valid."
 
-    bank_name, bank_status = resolve_bank(bank_alias)
+    bank, status = resolve_bank(bank_alias)
 
-    if bank_status == "AMBIGUOUS":
-        return f"❌ Bank alias ambiguous: <b>{bank_alias}</b>"
-
-    if not bank_name:
+    if not bank:
         return f"❌ Bank alias not found: <b>{bank_alias}</b>"
 
-    if not is_bank_active_by_status(bank_status):
-        return (
-            f"❌ <b>WD REJECTED</b>\n\n"
-            f"👤 Player: <b>{player}</b>\n"
-            f"🏦 WD Bank: <b>{bank_name}</b>\n"
-            f"Status: <b>{bank_status}</b>\n\n"
-            f"Reason: Bank is STOP/LIMIT/ISSUE or not found in Bank_List."
-        )
+    if status not in ACTIVE_STATUS:
+        return f"❌ WD rejected. Bank not ACTIVE: <b>{bank}</b> ({status})"
 
-    used, summary_status = bank_was_used_for_deposit(player, bank_name)
+    used, summary_status = bank_was_used_for_deposit(player, bank)
 
     if summary_status is None:
-        return (
-            f"❌ Bank not found in Player_Summary header:\n"
-            f"<b>{bank_name}</b>\n\n"
-            f"Pastikan nama bank sama persis dengan header di Player_Summary."
-        )
+        return f"❌ Bank not found in Player_Summary header: <b>{bank}</b>"
 
     if used:
         return (
             f"❌ <b>WD REJECTED</b>\n\n"
             f"👤 Player: <b>{player}</b>\n"
-            f"🏦 WD Bank: <b>{bank_name}</b>\n\n"
+            f"🏦 WD Bank: <b>{bank}</b>\n"
             f"Reason: Player already used this bank for deposit."
         )
 
@@ -627,29 +434,28 @@ def handle_wd(args, username):
         player=player,
         tx_type="Withdraw",
         amount=amount,
-        bank=bank_name,
+        bank=bank,
         entered_by=username,
-        remark=f"Telegram Bot Withdraw | alias: {bank_alias}",
+        remark=f"Telegram /wd | alias: {bank_alias}",
     )
 
-    return (
-        f"✅ <b>WD allowed & recorded</b>\n\n"
-        f"👤 Player: <b>{player}</b>\n"
-        f"💰 Amount: <b>{amount}</b>\n"
-        f"🏦 WD Bank: <b>{bank_name}</b>"
-    )
+    return f"✅ WD recorded\n👤 {player}\n💰 {amount}\n🏦 {bank}"
 
 
-def list_active_banks():
-    active, stopped = get_all_active_banks()
+def list_banks():
+    active, stopped = get_active_and_stopped_banks()
+    _, bank_totals = get_today_stats()
 
-    active_text = "\n".join([f"• {x}" for x in active]) if active else "-"
-    stopped_text = "\n".join([f"• {x}" for x in stopped]) if stopped else "-"
+    active_lines = []
+    for bank in active:
+        active_lines.append(f"• {bank} — today {fmt_money(bank_totals.get(normalize(bank), 0.0))}")
+
+    stopped_lines = [f"• {x}" for x in stopped]
 
     return (
         f"🏦 <b>Bank Status</b>\n\n"
-        f"✅ ACTIVE:\n{active_text}\n\n"
-        f"🚫 STOP/LIMIT/ISSUE:\n{stopped_text}"
+        f"✅ ACTIVE:\n{chr(10).join(active_lines) if active_lines else '-'}\n\n"
+        f"🚫 STOP/LIMIT/ISSUE:\n{chr(10).join(stopped_lines) if stopped_lines else '-'}"
     )
 
 
@@ -661,7 +467,6 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-
     message = data.get("message") or data.get("edited_message")
     if not message:
         return "ok"
@@ -676,45 +481,30 @@ def webhook():
     )
 
     try:
-        # Reply confirmation: +500 award
-        if text.startswith("+"):
-            reply = handle_reply_deposit(message)
-            if reply:
-                send_message(chat_id, reply, msg_id)
-            return "ok"
-
-        command, args = parse_command(text)
+        parts = text.split()
+        command = parts[0].lower() if parts else ""
+        args = parts[1:]
 
         if command in ["/start", "/help"]:
             reply = (
                 "🤖 <b>Bank Deposit Checker Bot</b>\n\n"
-                "Commands:\n"
                 "<code>/check player</code>\n"
-                "<code>/banks</code>\n"
                 "<code>/dep player amount bank_alias</code>\n"
-                "<code>/wd player amount bank_alias</code>\n\n"
-                "Reply confirm deposit:\n"
-                "<code>+500 award</code>\n\n"
-                "Examples:\n"
-                "<code>/check ani0128</code>\n"
-                "<code>/dep Jimmy88 500 horizon</code>\n"
-                "<code>/wd Jimmy88 300 cozy</code>"
+                "<code>/wd player amount bank_alias</code>\n"
+                "<code>/banks</code>"
             )
 
         elif command == "/check":
-            if not args:
-                reply = "❌ Format: <code>/check player</code>"
-            else:
-                reply = get_player_check_message(" ".join(args))
-
-        elif command == "/banks":
-            reply = list_active_banks()
+            reply = get_player_check(" ".join(args)) if args else "❌ Format: <code>/check player</code>"
 
         elif command == "/dep":
-            reply = handle_dep_command(args, username)
+            reply = handle_dep(args, username)
 
         elif command == "/wd":
             reply = handle_wd(args, username)
+
+        elif command == "/banks":
+            reply = list_banks()
 
         else:
             return "ok"
