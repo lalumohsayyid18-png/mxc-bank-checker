@@ -19,6 +19,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SHEET_TRANSACTIONS = "Transactions"
 SHEET_PLAYER_SUMMARY = "Player_Summary"
+SHEET_BANK_LIST = "Bank_List"
+
+ACTIVE_STATUS = {"ACTIVE"}
+STOP_STATUS = {"STOP", "LIMIT", "ISSUE", "INACTIVE", "OFF", "CLOSED", "DISABLED"}
 
 app = Flask(__name__)
 
@@ -60,6 +64,57 @@ def parse_command(text):
     return parts[0].lower(), parts[1:]
 
 
+def get_bank_status_map():
+    """
+    Bank_List format expected:
+    Row 3 header:
+    A = Bank Name
+    B = Code
+    C = Status
+
+    Data starts row 4.
+    """
+    ss = get_sheet()
+    ws = ss.worksheet(SHEET_BANK_LIST)
+    rows = ws.get_all_values()
+
+    bank_map = {}
+
+    for row in rows[3:]:
+        if not row:
+            continue
+
+        bank_name = clean_text(row[0]) if len(row) > 0 else ""
+        status = clean_text(row[2]) if len(row) > 2 else ""
+
+        if not bank_name:
+            continue
+
+        if not status:
+            status = "ACTIVE"
+
+        bank_map[normalize(bank_name)] = {
+            "name": bank_name,
+            "status": status.upper(),
+        }
+
+    return bank_map
+
+
+def is_bank_active(bank_name, bank_map=None):
+    if bank_map is None:
+        bank_map = get_bank_status_map()
+
+    item = bank_map.get(normalize(bank_name))
+
+    # If bank is not found in Bank_List, treat as NOT active to avoid CS using unknown bank.
+    if not item:
+        return False, "NOT FOUND"
+
+    status = clean_text(item.get("status")).upper()
+    return status in ACTIVE_STATUS, status
+
+
 def find_summary_row(player):
     ss = get_sheet()
     ws = ss.worksheet(SHEET_PLAYER_SUMMARY)
@@ -78,29 +133,82 @@ def find_summary_row(player):
     return headers, None
 
 
+def get_summary_value(headers, row, header_name):
+    for i, h in enumerate(headers):
+        if normalize(h) == normalize(header_name):
+            return clean_text(row[i]) if i < len(row) else ""
+    return ""
+
+
+def get_bank_status_from_summary(headers, row, bank_name):
+    bank_key = normalize(bank_name)
+
+    for i, h in enumerate(headers):
+        if normalize(h) == bank_key:
+            return clean_text(row[i]) if i < len(row) else ""
+
+    return None
+
+
+def split_bank_list(value):
+    if not value or value == "-":
+        return []
+
+    parts = [clean_text(x) for x in str(value).split(",")]
+    return [x for x in parts if x]
+
+
+def get_allowed_active_wd_banks(headers, row):
+    """
+    Takes allowed WD banks from Player_Summary,
+    then filters only Bank_List status ACTIVE.
+    """
+    bank_map = get_bank_status_map()
+
+    allowed_raw = get_summary_value(headers, row, "Allowed WD Banks")
+    allowed_banks = split_bank_list(allowed_raw)
+
+    active_allowed = []
+    hidden_banks = []
+
+    for bank in allowed_banks:
+        active, status = is_bank_active(bank, bank_map)
+
+        if active:
+            active_allowed.append(bank)
+        else:
+            hidden_banks.append(f"{bank} ({status})")
+
+    return active_allowed, hidden_banks
+
+
 def check_player(player):
     headers, row = find_summary_row(player)
     if not row:
         return f"❌ Player not found:\n<b>{player}</b>"
 
-    # Detect columns by header name
-    def get_col(header_name):
-        for i, h in enumerate(headers):
-            if normalize(h) == normalize(header_name):
-                return clean_text(row[i]) if i < len(row) else ""
-        return ""
+    count = (
+        get_summary_value(headers, row, "Used Deposit Bank Count")
+        or get_summary_value(headers, row, "Used Deposit Bank")
+        or "0"
+    )
+    used = get_summary_value(headers, row, "Deposit Banks Used") or "-"
+    control = get_summary_value(headers, row, "Control") or "-"
 
-    count = get_col("Used Deposit Bank Count") or get_col("Used Deposit Bank")
-    used = get_col("Deposit Banks Used") or "-"
-    allowed = get_col("Allowed WD Banks") or "-"
-    control = get_col("Control") or "-"
+    active_allowed, hidden_banks = get_allowed_active_wd_banks(headers, row)
+
+    allowed_text = "\n".join(active_allowed) if active_allowed else "-"
+    hidden_text = ""
+    if hidden_banks:
+        hidden_text = "\n\n🚫 Hidden STOP/LIMIT banks:\n" + "\n".join(hidden_banks)
 
     return (
         f"🔎 <b>Player Check</b>\n\n"
         f"👤 Player: <b>{clean_text(row[0])}</b>\n"
         f"🏦 Used Deposit Bank Count: <b>{count}</b>\n\n"
         f"📥 Deposit Banks Used:\n{used}\n\n"
-        f"📤 Allowed WD Banks:\n{allowed}\n\n"
+        f"📤 Allowed WD Banks ACTIVE only:\n{allowed_text}"
+        f"{hidden_text}\n\n"
         f"⚠️ Status:\n{control}"
     )
 
@@ -111,7 +219,6 @@ def append_transaction(player, tx_type, amount, bank, entered_by="BOT", remark="
 
     today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Columns based on your sheet:
     # A Date | B Player | C Type | D Bank | E Amount | F Remark | G Entered By
     ws.append_row(
         [today, player, tx_type, bank, amount, remark, entered_by],
@@ -124,14 +231,12 @@ def bank_was_used_for_deposit(player, bank):
     if not row:
         return False, None
 
-    bank_key = normalize(bank)
+    status = get_bank_status_from_summary(headers, row, bank)
 
-    for i, h in enumerate(headers):
-        if normalize(h) == bank_key:
-            status = clean_text(row[i]) if i < len(row) else ""
-            return normalize(status) == "dep used", status
+    if status is None:
+        return False, None
 
-    return False, None
+    return normalize(status) == "dep used", status
 
 
 def handle_dep(args, username):
@@ -150,6 +255,16 @@ def handle_dep(args, username):
 
     if not re.match(r"^\d+(\.\d{1,2})?$", amount.replace(",", "")):
         return "❌ Amount tidak valid."
+
+    active, bank_status = is_bank_active(bank)
+
+    if not active:
+        return (
+            f"❌ <b>DEPOSIT REJECTED</b>\n\n"
+            f"🏦 Bank: <b>{bank}</b>\n"
+            f"Status: <b>{bank_status}</b>\n\n"
+            f"Reason: Bank is not ACTIVE in Bank_List."
+        )
 
     amount = amount.replace(",", "")
 
@@ -188,11 +303,20 @@ def handle_wd(args, username):
     if not re.match(r"^\d+(\.\d{1,2})?$", amount.replace(",", "")):
         return "❌ Amount tidak valid."
 
-    amount = amount.replace(",", "")
+    active, bank_status = is_bank_active(bank)
 
-    used, status = bank_was_used_for_deposit(player, bank)
+    if not active:
+        return (
+            f"❌ <b>WD REJECTED</b>\n\n"
+            f"👤 Player: <b>{player}</b>\n"
+            f"🏦 WD Bank: <b>{bank}</b>\n"
+            f"Status: <b>{bank_status}</b>\n\n"
+            f"Reason: Bank is STOP/LIMIT/ISSUE or not found in Bank_List."
+        )
 
-    if status is None:
+    used, summary_status = bank_was_used_for_deposit(player, bank)
+
+    if summary_status is None:
         return (
             f"❌ Bank not found in Player_Summary header:\n"
             f"<b>{bank}</b>\n\n"
@@ -206,6 +330,8 @@ def handle_wd(args, username):
             f"🏦 WD Bank: <b>{bank}</b>\n\n"
             f"Reason: Player already used this bank for deposit."
         )
+
+    amount = amount.replace(",", "")
 
     append_transaction(
         player=player,
@@ -221,6 +347,31 @@ def handle_wd(args, username):
         f"👤 Player: <b>{player}</b>\n"
         f"💰 Amount: <b>{amount}</b>\n"
         f"🏦 WD Bank: <b>{bank}</b>"
+    )
+
+
+def list_active_banks():
+    bank_map = get_bank_status_map()
+
+    active = []
+    stopped = []
+
+    for item in bank_map.values():
+        name = item["name"]
+        status = item["status"]
+
+        if status in ACTIVE_STATUS:
+            active.append(name)
+        else:
+            stopped.append(f"{name} ({status})")
+
+    active_text = "\n".join(active) if active else "-"
+    stopped_text = "\n".join(stopped) if stopped else "-"
+
+    return (
+        f"🏦 <b>Bank Status</b>\n\n"
+        f"✅ ACTIVE:\n{active_text}\n\n"
+        f"🚫 STOP/LIMIT/ISSUE:\n{stopped_text}"
     )
 
 
@@ -255,7 +406,8 @@ def webhook():
                 "Commands:\n"
                 "<code>/check player</code>\n"
                 "<code>/dep player amount bank</code>\n"
-                "<code>/wd player amount bank</code>\n\n"
+                "<code>/wd player amount bank</code>\n"
+                "<code>/banks</code>\n\n"
                 "Example:\n"
                 "<code>/check Jimmy88</code>\n"
                 "<code>/dep Jimmy88 500 ANEXT HORIZON</code>\n"
@@ -273,6 +425,9 @@ def webhook():
 
         elif command == "/wd":
             reply = handle_wd(args, username)
+
+        elif command == "/banks":
+            reply = list_active_banks()
 
         else:
             return "ok"
